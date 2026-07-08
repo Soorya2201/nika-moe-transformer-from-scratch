@@ -1,12 +1,15 @@
 """
-nika_ai.tokenizer — minimal from-scratch byte-level BPE.
+nika_ai.tokenizer — two BPE tokenizers, kept side by side deliberately.
 
-Starts from the 256 raw byte values as the base vocabulary and iteratively merges
-the most frequent adjacent pair into a new token, exactly like GPT-2's tokenizer
-(Sennrich et al.'s BPE applied to bytes instead of characters, avoiding any
-"unknown token" problem since every possible byte sequence is representable).
-No dependency on tiktoken/sentencepiece — this is the "from scratch" project's
-tokenizer too.
+`BPETokenizer` is a from-scratch byte-level BPE (below): starts from the 256 raw
+byte values and iteratively merges the most frequent adjacent pair, exactly like
+GPT-2's tokenizer. Good for understanding the algorithm; it's a pure-Python O(n)
+-per-merge implementation, not fast.
+
+`FastBPETokenizer` wraps HuggingFace's `tokenizers` library — the Rust-backed byte
+-level BPE that real tokenizer training actually uses. `train.py` uses this one by
+default: knowing how BPE works (above) and knowing the standard, fast tool for
+actually running it (below) are both worth having built/used, not an either/or.
 """
 
 from __future__ import annotations
@@ -104,3 +107,48 @@ class BPETokenizer:
                 merged.append(ids[i])
                 i += 1
         return merged
+
+
+class FastBPETokenizer:
+    """Byte-level BPE via HuggingFace's `tokenizers` library (Rust-backed).
+
+    Same algorithm as `BPETokenizer` above, same byte-level pre-tokenization GPT-2
+    uses, but implemented in Rust — this is what real tokenizer training actually
+    runs, since the pure-Python version is far too slow past toy-corpus sizes.
+    """
+
+    def __init__(self):
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+
+        self._tokenizer = Tokenizer(models.BPE(unk_token=None))
+        self._tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        self._tokenizer.decoder = decoders.ByteLevel()
+
+    @property
+    def vocab_size(self) -> int:
+        return self._tokenizer.get_vocab_size()
+
+    def train(self, text: str, vocab_size: int) -> None:
+        from tokenizers import pre_tokenizers, trainers
+
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        )
+        # train_from_iterator over a single string still works: the ByteLevel
+        # pre-tokenizer is what actually splits it into training chunks.
+        self._tokenizer.train_from_iterator([text], trainer=trainer)
+
+    def encode(self, text: str) -> list[int]:
+        return self._tokenizer.encode(text).ids
+
+    def decode(self, ids: list[int]) -> str:
+        return self._tokenizer.decode(ids)
+
+    def save(self, path: str) -> None:
+        self._tokenizer.save(path)
+
+    def load(self, path: str) -> None:
+        from tokenizers import Tokenizer
+
+        self._tokenizer = Tokenizer.from_file(path)

@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nika-ai"
 version = "0.1.0"
-description = "From-scratch decoder-only transformer with a 2-expert MoE MLP, RoPE, GQA, and a hand-rolled ring all-reduce."
+description = "From-scratch decoder-only transformer with a 2-expert MoE MLP, RoPE, dropout, a hand-rolled ring all-reduce, and torch.fx/export tracing."
 requires-python = ">=3.9"
 dependencies = [
     "torch>=2.0",
     "numpy",
+    "tokenizers",
 ]
 
 [tool.setuptools.packages.find]
