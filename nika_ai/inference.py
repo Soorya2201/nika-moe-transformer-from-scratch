@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from nika_ai.model import NikaMoEConfig, NikaMoETransformer
-from nika_ai.tokenizer import BPETokenizer
+from nika_ai.tokenizer import FastBPETokenizer
 
 
 class KVCache:
@@ -31,7 +31,7 @@ class KVCache:
 
     def __init__(self, config: NikaMoEConfig, batch_size: int, device, dtype=torch.float32):
         head_dim = config.hidden_size // config.n_heads
-        shape = (batch_size, config.n_kv_heads, config.max_seq_len, head_dim)
+        shape = (batch_size, config.n_heads, config.max_seq_len, head_dim)
         self.k_cache = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(config.n_layers)]
         self.v_cache = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(config.n_layers)]
         self.cur_len = 0
@@ -146,15 +146,18 @@ def expert_usage_fraction(routing: list[torch.Tensor], n_experts: int) -> list[l
     return usage
 
 
-def load_model_for_inference(checkpoint_path: str, device: str) -> tuple[NikaMoETransformer, BPETokenizer]:
+def load_model_for_inference(checkpoint_path: str, device: str) -> tuple[NikaMoETransformer, FastBPETokenizer]:
     ckpt = torch.load(checkpoint_path, map_location=device)
     model_config = NikaMoEConfig(**ckpt["model_config"])
     model = NikaMoETransformer(model_config).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
+    # train.py saves with FastBPETokenizer (see nika_ai.tokenizer) -- must load
+    # with the same class, its on-disk format differs from the from-scratch
+    # BPETokenizer's.
     tokenizer_path = os.path.join(os.path.dirname(checkpoint_path), "tokenizer.json")
-    tokenizer = BPETokenizer()
+    tokenizer = FastBPETokenizer()
     tokenizer.load(tokenizer_path)
 
     return model, tokenizer
