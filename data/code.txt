@@ -1,0 +1,151 @@
+import functools
+import heapq
+
+
+def fibonacci(n):
+    """Return the nth Fibonacci number using simple bottom-up iteration."""
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+
+@functools.lru_cache(maxsize=None)
+def fibonacci_memo(n):
+    """Same result as fibonacci(), but memoized for repeated calls."""
+    if n < 2:
+        return n
+    return fibonacci_memo(n - 1) + fibonacci_memo(n - 2)
+
+
+def quicksort(items):
+    """Sort a list in ascending order using the classic quicksort partition scheme."""
+    if len(items) <= 1:
+        return items
+    pivot = items[len(items) // 2]
+    left = [x for x in items if x < pivot]
+    middle = [x for x in items if x == pivot]
+    right = [x for x in items if x > pivot]
+    return quicksort(left) + middle + quicksort(right)
+
+
+def merge_sort(items):
+    """Sort a list using merge sort, useful when stability matters."""
+    if len(items) <= 1:
+        return items
+    mid = len(items) // 2
+    left = merge_sort(items[:mid])
+    right = merge_sort(items[mid:])
+    merged = []
+    i = j = 0
+    while i < len(left) and j < len(right):
+        if left[i] <= right[j]:
+            merged.append(left[i])
+            i += 1
+        else:
+            merged.append(right[j])
+            j += 1
+    merged.extend(left[i:])
+    merged.extend(right[j:])
+    return merged
+
+
+class Graph:
+    """A simple directed graph backed by an adjacency list."""
+
+    def __init__(self):
+        self.adjacency = {}
+
+    def add_edge(self, source, target, weight=1):
+        self.adjacency.setdefault(source, []).append((target, weight))
+        self.adjacency.setdefault(target, [])
+
+    def shortest_path(self, start, end):
+        """Dijkstra's algorithm over the adjacency list, returning total distance."""
+        distances = {node: float("inf") for node in self.adjacency}
+        distances[start] = 0
+        visited = set()
+        heap = [(0, start)]
+
+        while heap:
+            dist, node = heapq.heappop(heap)
+            if node in visited:
+                continue
+            visited.add(node)
+            if node == end:
+                return dist
+            for neighbor, weight in self.adjacency.get(node, []):
+                new_dist = dist + weight
+                if new_dist < distances[neighbor]:
+                    distances[neighbor] = new_dist
+                    heapq.heappush(heap, (new_dist, neighbor))
+
+        return distances.get(end, float("inf"))
+
+
+class LRUCache:
+    """A minimal least-recently-used cache backed by an ordered dict."""
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self._store = {}
+
+    def get(self, key, default=None):
+        if key not in self._store:
+            return default
+        value = self._store.pop(key)
+        self._store[key] = value
+        return value
+
+    def put(self, key, value):
+        if key in self._store:
+            self._store.pop(key)
+        elif len(self._store) >= self.capacity:
+            oldest_key = next(iter(self._store))
+            self._store.pop(oldest_key)
+        self._store[key] = value
+
+
+def binary_search(sorted_items, target):
+    """Return the index of target in sorted_items, or -1 if not present."""
+    low, high = 0, len(sorted_items) - 1
+    while low <= high:
+        mid = (low + high) // 2
+        if sorted_items[mid] == target:
+            return mid
+        if sorted_items[mid] < target:
+            low = mid + 1
+        else:
+            high = mid - 1
+    return -1
+
+
+def flatten(nested_list):
+    """Recursively flatten an arbitrarily nested list into a single flat list."""
+    result = []
+    for item in nested_list:
+        if isinstance(item, list):
+            result.extend(flatten(item))
+        else:
+            result.append(item)
+    return result
+
+
+class RingBuffer:
+    """A fixed-size circular buffer that overwrites the oldest entry when full."""
+
+    def __init__(self, size):
+        self.size = size
+        self.data = [None] * size
+        self.index = 0
+        self.count = 0
+
+    def push(self, value):
+        self.data[self.index] = value
+        self.index = (self.index + 1) % self.size
+        self.count = min(self.count + 1, self.size)
+
+    def to_list(self):
+        if self.count < self.size:
+            return self.data[: self.count]
+        return self.data[self.index :] + self.data[: self.index]

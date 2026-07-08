@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nika-ai"
+version = "0.1.0"
+description = "From-scratch decoder-only transformer with a 2-expert MoE MLP, RoPE, GQA, and a hand-rolled ring all-reduce."
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+]
+
+[tool.setuptools.packages.find]
+include = ["nika_ai*"]
