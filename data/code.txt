@@ -149,3 +149,150 @@ class RingBuffer:
         if self.count < self.size:
             return self.data[: self.count]
         return self.data[self.index :] + self.data[: self.index]
+
+
+class Trie:
+    """A prefix tree supporting insert, search, and prefix queries."""
+
+    def __init__(self):
+        self.children = {}
+        self.is_word = False
+
+    def insert(self, word):
+        node = self
+        for ch in word:
+            node = node.children.setdefault(ch, Trie())
+        node.is_word = True
+
+    def search(self, word):
+        node = self._walk(word)
+        return node is not None and node.is_word
+
+    def starts_with(self, prefix):
+        return self._walk(prefix) is not None
+
+    def _walk(self, prefix):
+        node = self
+        for ch in prefix:
+            if ch not in node.children:
+                return None
+            node = node.children[ch]
+        return node
+
+
+def two_sum(numbers, target):
+    """Return indices of the two numbers that add up to target, or None."""
+    seen = {}
+    for i, value in enumerate(numbers):
+        complement = target - value
+        if complement in seen:
+            return (seen[complement], i)
+        seen[value] = i
+    return None
+
+
+def longest_common_subsequence(a, b):
+    """Return the length of the longest common subsequence of a and b."""
+    n, m = len(a), len(b)
+    table = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if a[i - 1] == b[j - 1]:
+                table[i][j] = table[i - 1][j - 1] + 1
+            else:
+                table[i][j] = max(table[i - 1][j], table[i][j - 1])
+    return table[n][m]
+
+
+class MinHeap:
+    """A minimal binary min-heap implemented without the heapq module."""
+
+    def __init__(self):
+        self.data = []
+
+    def push(self, value):
+        self.data.append(value)
+        self._sift_up(len(self.data) - 1)
+
+    def pop(self):
+        top = self.data[0]
+        last = self.data.pop()
+        if self.data:
+            self.data[0] = last
+            self._sift_down(0)
+        return top
+
+    def _sift_up(self, idx):
+        while idx > 0:
+            parent = (idx - 1) // 2
+            if self.data[parent] <= self.data[idx]:
+                break
+            self.data[parent], self.data[idx] = self.data[idx], self.data[parent]
+            idx = parent
+
+    def _sift_down(self, idx):
+        n = len(self.data)
+        while True:
+            left, right = 2 * idx + 1, 2 * idx + 2
+            smallest = idx
+            if left < n and self.data[left] < self.data[smallest]:
+                smallest = left
+            if right < n and self.data[right] < self.data[smallest]:
+                smallest = right
+            if smallest == idx:
+                break
+            self.data[idx], self.data[smallest] = self.data[smallest], self.data[idx]
+            idx = smallest
+
+
+def is_balanced(expression):
+    """Check whether an expression's brackets are properly balanced and nested."""
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack = []
+    for ch in expression:
+        if ch in "([{":
+            stack.append(ch)
+        elif ch in ")]}":
+            if not stack or stack.pop() != pairs[ch]:
+                return False
+    return not stack
+
+
+def sliding_window_max(values, k):
+    """Return the maximum of every contiguous window of size k."""
+    from collections import deque
+
+    dq = deque()
+    result = []
+    for i, value in enumerate(values):
+        while dq and values[dq[-1]] <= value:
+            dq.pop()
+        dq.append(i)
+        if dq[0] <= i - k:
+            dq.popleft()
+        if i >= k - 1:
+            result.append(values[dq[0]])
+    return result
+
+
+class UnionFind:
+    """Disjoint-set union with path compression and union by rank."""
+
+    def __init__(self, n):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x):
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
+
+    def union(self, a, b):
+        root_a, root_b = self.find(a), self.find(b)
+        if root_a == root_b:
+            return
+        if self.rank[root_a] < self.rank[root_b]:
+            root_a, root_b = root_b, root_a
+        self.parent[root_b] = root_a
+        if self.rank[root_a] == self.rank[root_b]:
+            self.rank[root_a] += 1
