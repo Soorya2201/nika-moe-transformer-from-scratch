@@ -3,11 +3,17 @@ nika_ai.model — architecture only (no training loop, no generation loop).
 
     tokens -> embed -> [ (RMSNorm -> Attention -> +residual) -> (RMSNorm -> MoE(2 experts) -> +residual) ] x N -> RMSNorm -> unembed -> logits
 
-Same LLaMA/Mistral-style pre-norm decoder as before (RMSNorm, RoPE, GQA), but the
-dense SwiGLU MLP is replaced by a 2-expert, top-1-routed Mixture of Experts MLP:
-each token is sent to exactly one of two SwiGLU experts, intended to specialize on
-different subject matter when trained on mixed-domain data. train.py and
-inference.py both import this file so the architecture never drifts between them.
+Pre-norm decoder with RMSNorm + RoPE, standard (non-grouped) multi-head causal
+self-attention, and a 2-expert top-1-routed Mixture of Experts MLP in place of a
+dense MLP: each token is sent to exactly one of two SwiGLU experts, intended to
+specialize on different subject matter when trained on mixed-domain data.
+train.py and inference.py both import this file so the architecture never drifts
+between them.
+
+Toy spec (see README for the full parameter accounting):
+    vocab_size (trained)  ~1-4K   d_model = 128     n_layers = 4
+    n_heads    = 4 (head_dim=32)  n_experts = 2      top_k = 1 (hardcoded, not configurable)
+    expert_intermediate_size = 2688  (-> ~1M params per SwiGLU expert)
 """
 
 from __future__ import annotations
@@ -23,13 +29,13 @@ import torch.nn.functional as F
 @dataclass
 class NikaMoEConfig:
     vocab_size: int
-    hidden_size: int
+    hidden_size: int                 # d_model
     n_layers: int
-    n_heads: int                    # number of query heads
-    n_kv_heads: int                  # number of key/value heads (GQA: n_kv_heads < n_heads)
+    n_heads: int                    # standard multi-head attention: every head has its own K/V
     n_experts: int                   # number of MoE experts (2, one per subject domain)
-    expert_intermediate_size: int     # SwiGLU hidden dim, per expert
-    max_seq_len: int = 256
+    expert_intermediate_size: int     # SwiGLU hidden dim, per expert (d_ff)
+    max_seq_len: int = 128
+    dropout_prob: float = 0.1        # attention-probability and residual dropout; disabled via model.eval()
     rope_theta: float = 10000.0
     rms_norm_eps: float = 1e-5
     tie_word_embeddings: bool = True
@@ -37,7 +43,6 @@ class NikaMoEConfig:
 
     def __post_init__(self):
         assert self.hidden_size % self.n_heads == 0
-        assert self.n_heads % self.n_kv_heads == 0
         assert self.n_experts >= 1
 
 
@@ -96,28 +101,24 @@ def apply_rotary_pos_emb(
     return q_rot, k_rot
 
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """(B, n_kv_heads, T, D) -> (B, n_kv_heads * n_rep, T, D), the GQA broadcast."""
-    if n_rep == 1:
-        return x
-    b, n_kv_heads, t, d = x.shape
-    x = x[:, :, None, :, :].expand(b, n_kv_heads, n_rep, t, d)
-    return x.reshape(b, n_kv_heads * n_rep, t, d)
-
-
 class Attention(nn.Module):
-    """Causal self-attention with grouped-query attention and RoPE."""
+    """Standard (non-grouped) causal multi-head self-attention with RoPE.
+
+    Every query head has its own K/V head (no GQA) -- at this toy scale (n_heads=4,
+    head_dim=32) there's no KV-cache-memory pressure to trade away quality for, so
+    plain multi-head attention is the right default, not a simplification of
+    something better.
+    """
 
     def __init__(self, config: NikaMoEConfig):
         super().__init__()
         self.n_heads = config.n_heads
-        self.n_kv_heads = config.n_kv_heads
-        self.n_rep = config.n_heads // config.n_kv_heads
         self.head_dim = config.hidden_size // config.n_heads
+        self.dropout_prob = config.dropout_prob
 
         self.q_proj = nn.Linear(config.hidden_size, config.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.n_kv_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.n_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.n_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.n_heads * self.head_dim, config.hidden_size, bias=False)
 
     def forward(
@@ -132,18 +133,18 @@ class Attention(nn.Module):
         b, t, _ = x.shape
 
         q = self.q_proj(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if kv_cache is not None:
             k, v = kv_cache.update(layer_idx, k, v)
 
-        k = repeat_kv(k, self.n_rep)
-        v = repeat_kv(v, self.n_rep)
-
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        # SDPA's own dropout_p only ever applies when we explicitly pass it, so we
+        # gate it on self.training ourselves -- SDPA has no notion of train/eval.
+        dropout_p = self.dropout_prob if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, dropout_p=dropout_p)
         out = out.transpose(1, 2).contiguous().view(b, t, self.n_heads * self.head_dim)
         return self.o_proj(out)
 
@@ -214,6 +215,34 @@ class MoELayer(nn.Module):
         routing = expert_idx.view(b, t) if collect_routing else None
         return out.view(b, t, h), aux_loss, routing
 
+    def forward_traceable(self, x: torch.Tensor) -> torch.Tensor:
+        """Export/fx-traceable version of the same routing math -- see nika_ai.tracing.
+
+        forward() above uses `if mask.any():` and boolean-mask indexing (`x_flat[mask]`)
+        to run each expert only on the tokens routed to it -- real compute savings,
+        but both the Python `if` on a tensor-derived condition and the
+        data-dependent-shape mask indexing are exactly what torch.export (and even
+        plain torch.fx.symbolic_trace) cannot represent in a static graph: the graph
+        has to be the same shape regardless of what the router decides at runtime.
+        This version computes every expert on every token (strictly more FLOPs) and
+        combines with a one-hot mask instead of a boolean-indexed dispatch, so every
+        op and every tensor shape is fixed at trace time. Not used by real
+        training/inference (forward() is more efficient) -- this exists purely to
+        demonstrate the fix for the class of bug real MoE graph export hits.
+        """
+        b, t, h = x.shape
+        x_flat = x.reshape(-1, h)
+
+        router_logits = self.router(x_flat)
+        router_probs = F.softmax(router_logits, dim=-1)
+        expert_weight, expert_idx = router_probs.max(dim=-1)
+
+        expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)  # (N, n_experts, H)
+        one_hot = F.one_hot(expert_idx, num_classes=self.n_experts).to(expert_outputs.dtype)  # (N, n_experts)
+        combined = (expert_outputs * one_hot.unsqueeze(-1)).sum(dim=1)  # (N, H)
+
+        return (combined * expert_weight.unsqueeze(-1)).view(b, t, h)
+
     def _load_balancing_loss(self, router_probs: torch.Tensor, expert_idx: torch.Tensor) -> torch.Tensor:
         """Switch-Transformer load-balancing loss: n_experts * sum_i(f_i * P_i).
 
@@ -228,7 +257,12 @@ class MoELayer(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """One pre-norm block: RMSNorm -> Attention -> +residual, RMSNorm -> MoE -> +residual."""
+    """One pre-norm block: RMSNorm -> Attention -> +residual, RMSNorm -> MoE -> +residual.
+
+    Residual dropout (nn.Dropout, so it automatically respects model.train()/eval())
+    is applied to each sublayer's output before it's added back to the residual
+    stream -- the standard GPT-style dropout placement.
+    """
 
     def __init__(self, config: NikaMoEConfig):
         super().__init__()
@@ -236,6 +270,7 @@ class TransformerBlock(nn.Module):
         self.self_attn = Attention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(config)
+        self.resid_dropout = nn.Dropout(config.dropout_prob)
 
     def forward(
         self,
@@ -247,9 +282,9 @@ class TransformerBlock(nn.Module):
         is_causal: bool = True,
         collect_routing: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, kv_cache, layer_idx, is_causal)
+        x = x + self.resid_dropout(self.self_attn(self.input_layernorm(x), cos, sin, kv_cache, layer_idx, is_causal))
         moe_out, aux_loss, routing = self.moe(self.post_attention_layernorm(x), collect_routing=collect_routing)
-        x = x + moe_out
+        x = x + self.resid_dropout(moe_out)
         return x, aux_loss, routing
 
 
