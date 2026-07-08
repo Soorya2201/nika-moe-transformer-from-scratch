@@ -12,8 +12,18 @@ coefficient so it nudges routing without dominating the language-modeling signal
 Single-process:
     python -m nika_ai.train
 
-Distributed (hand-rolled ring all-reduce, see nika_ai.distributed), 2 local processes:
-    torchrun --nproc_per_node=2 -m nika_ai.train --distributed
+Distributed, two ways -- both runnable via torchrun over N local CPU processes
+using the gloo backend (see nika_ai.distributed for why gloo, and README for the
+multi-process-vs-multi-node distinction):
+
+    torchrun --nproc_per_node=2 -m nika_ai.train --distributed-mode manual   # hand-rolled ring all-reduce
+    torchrun --nproc_per_node=2 -m nika_ai.train --distributed-mode ddp      # real nn.parallel.DistributedDataParallel
+
+"manual" is our own gradient-sync code (nika_ai.distributed.sync_gradients), called
+explicitly after backward(). "ddp" is PyTorch's real DistributedDataParallel,
+which triggers all_reduce automatically via autograd hooks during backward() --
+having both side by side is what lets you say you've used the standard tool *and*
+built the mechanism it's hiding.
 """
 
 from __future__ import annotations
@@ -26,13 +36,14 @@ from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from nika_ai.data import DOMAINS, build_datasets, load_domain_text
 from nika_ai.distributed import broadcast_initial_weights, cleanup_distributed, setup_distributed, sync_gradients
 from nika_ai.model import NikaMoEConfig, NikaMoETransformer
-from nika_ai.tokenizer import BPETokenizer
+from nika_ai.tokenizer import FastBPETokenizer
 
 
 @dataclass
@@ -53,7 +64,10 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     eval_interval: int = 50
     log_interval: int = 10
-    distributed: bool = False
+    distributed_mode: str = "none"   # "none" | "manual" (hand-rolled ring all-reduce) | "ddp" (torch DistributedDataParallel)
+
+    def __post_init__(self):
+        assert self.distributed_mode in ("none", "manual", "ddp")
 
 
 def configure_optimizer(
@@ -153,17 +167,23 @@ def train(model_config: NikaMoEConfig, cfg: TrainConfig, history: list | None = 
     lets notebooks/analysis.ipynb plot loss curves without reimplementing the
     training loop itself.
     """
+    is_distributed = cfg.distributed_mode != "none"
     rank, world_size = 0, 1
-    if cfg.distributed:
+    if is_distributed:
         rank, world_size = setup_distributed()
 
     is_main = rank == 0
 
     # Tokenizer: train once (fast at this corpus size) and persist alongside the
     # checkpoint so inference.py can load the exact same vocabulary/merges.
-    tokenizer = BPETokenizer()
+    # vocab_size on the config is a target -- FastBPETokenizer's trainer stops
+    # early once it exhausts frequent pairs in a corpus this small, so the actual
+    # vocab (tokenizer.vocab_size) can land well below it; we resize the config
+    # to match whatever was actually learned before building the model.
+    tokenizer = FastBPETokenizer()
     combined_text = "".join(load_domain_text(d) for d in DOMAINS)
     tokenizer.train(combined_text, vocab_size=model_config.vocab_size)
+    model_config.vocab_size = tokenizer.vocab_size
     if is_main:
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
         tokenizer.save(os.path.join(cfg.checkpoint_dir, "tokenizer.json"))
@@ -171,14 +191,25 @@ def train(model_config: NikaMoEConfig, cfg: TrainConfig, history: list | None = 
     combined_train, domain_splits = build_datasets(tokenizer, cfg.seq_len)
 
     sampler = None
-    if cfg.distributed:
+    if is_distributed:
         sampler = DistributedSampler(combined_train, num_replicas=world_size, rank=rank, shuffle=True)
     loader = DataLoader(combined_train, batch_size=cfg.batch_size, shuffle=(sampler is None), sampler=sampler, drop_last=True)
     batches = _infinite_batches(loader, sampler)
 
     model = NikaMoETransformer(model_config).to(cfg.device)
-    if cfg.distributed:
+    if cfg.distributed_mode == "manual":
         broadcast_initial_weights(model, src=0)
+    elif cfg.distributed_mode == "ddp":
+        # DistributedDataParallel broadcasts rank 0's weights to every other rank
+        # in its constructor -- no separate broadcast_initial_weights call needed
+        # here, unlike the manual path. No device_ids: that argument is only for
+        # one-GPU-per-process CUDA setups, not the CPU/gloo path used here.
+        # find_unused_parameters=True: top-1 MoE routing means a small batch can
+        # route zero tokens to one expert, leaving its parameters without a
+        # gradient that step -- DDP's default backward hooks assume every
+        # parameter gets one, so this flag is required for correctness here, not
+        # just a performance knob.
+        model = DistributedDataParallel(model, find_unused_parameters=True)
 
     optimizer = configure_optimizer(model, cfg.weight_decay, cfg.lr_max, (cfg.beta1, cfg.beta2), cfg.eps)
 
@@ -202,8 +233,11 @@ def train(model_config: NikaMoEConfig, cfg: TrainConfig, history: list | None = 
             total_loss += loss.item()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        if cfg.distributed:
+        if cfg.distributed_mode == "manual":
             sync_gradients(model, rank, world_size)
+        # ddp mode needs no explicit sync here: DistributedDataParallel already
+        # triggered a real all_reduce per parameter via autograd hooks during
+        # each .backward() call above.
         optimizer.step()
 
         if is_main and step % cfg.log_interval == 0:
@@ -217,36 +251,48 @@ def train(model_config: NikaMoEConfig, cfg: TrainConfig, history: list | None = 
             if history is not None:
                 history.append({"step": step, "train_loss": total_loss / cfg.grad_accum_steps, **domain_losses})
 
+    # Unwrap DDP before saving/returning: DDP's state_dict prefixes every key
+    # with "module.", and downstream code (inference.py, the notebook) should
+    # never need to know whether a model was trained under DDP.
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+
     if is_main:
-        save_checkpoint(cfg.checkpoint_dir, "ckpt_final.pt", model, optimizer, cfg.max_steps, model_config, cfg)
+        save_checkpoint(cfg.checkpoint_dir, "ckpt_final.pt", raw_model, optimizer, cfg.max_steps, model_config, cfg)
         print(f"saved checkpoint to {os.path.join(cfg.checkpoint_dir, 'ckpt_final.pt')}", flush=True)
 
-    if cfg.distributed:
+    if is_distributed:
         cleanup_distributed()
 
-    return model, tokenizer, domain_splits
+    return raw_model, tokenizer, domain_splits
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--distributed", action="store_true", help="sync gradients across ranks via ring all-reduce")
+    parser.add_argument(
+        "--distributed-mode",
+        choices=["none", "manual", "ddp"],
+        default="none",
+        help="none: single process. manual: hand-rolled ring all-reduce. ddp: torch DistributedDataParallel.",
+    )
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     args = parser.parse_args()
 
+    # Toy spec: vocab_size is a target (see the tokenizer-training note above),
+    # d_model=128, n_layers=4, n_heads=4 (head_dim=32), 2 SwiGLU experts sized to
+    # ~1M params each (expert_intermediate_size=2688 -> 3*128*2688 ~= 1.03M).
     model_config = NikaMoEConfig(
-        vocab_size=768,
+        vocab_size=4000,
         hidden_size=128,
-        n_layers=3,
-        n_heads=8,
-        n_kv_heads=4,
+        n_layers=4,
+        n_heads=4,
         n_experts=2,
-        expert_intermediate_size=256,
-        max_seq_len=256,
+        expert_intermediate_size=2688,
+        max_seq_len=128,
     )
     train_config = TrainConfig(
         max_steps=args.max_steps,
         checkpoint_dir=args.checkpoint_dir,
-        distributed=args.distributed,
+        distributed_mode=args.distributed_mode,
     )
     train(model_config, train_config)
