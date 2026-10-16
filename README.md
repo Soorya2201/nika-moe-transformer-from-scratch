@@ -1,8 +1,21 @@
-# nika_ai — a from-scratch decoder-only transformer with a routed Mixture-of-Experts MLP
+# nika_ai: a Mixture-of-Experts transformer built from scratch
 
-This repository is a complete, from-scratch implementation of a modern decoder-only transformer language model, built in pure PyTorch with no dependence on HuggingFace `transformers`, no borrowed model code, and no black boxes left unopened. Every component in the diagram below — the normalization, the positional encoding, the attention mechanism, the mixture-of-experts routing, the training loop, the inference loop, and the distributed-training gradient synchronization — was implemented, unit-tested, and verified end-to-end by hand.
+**A decoder-only language model in pure PyTorch, with no Hugging Face `transformers` and no borrowed model code. It has a routed Mixture-of-Experts MLP, a hand-written ring all-reduce benchmarked against real DDP, and a `torch.export` investigation that reproduces and fixes the static-graph bug MoE models hit in production.**
 
-The model itself is intentionally small (~9M parameters, trained on a few kilobytes of text). The scope of the engineering is not: this project also includes a hand-rolled implementation of the ring all-reduce algorithm that underlies real distributed training frameworks, a working comparison against PyTorch's real `DistributedDataParallel`, and a graph-tracing investigation (`torch.fx` / `torch.export`) that deliberately reproduces — and fixes — the exact class of bug that real Mixture-of-Experts models hit when you try to export them to a static computation graph. The goal throughout was depth over scale: understanding *why* each design decision was made, being able to show the failure mode of the naive alternative, and having a test that proves it.
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-18%20passing-brightgreen?style=flat-square)
+![Params](https://img.shields.io/badge/params-9.03M-blue?style=flat-square)
+
+## Highlights
+
+- **Modern architecture, every piece hand-written:** pre-norm RMSNorm, rotary position embeddings (RoPE), causal multi-head attention, SwiGLU experts, a weight-tied embedding, and a KV cache.
+- **Top-1 routed MoE with real sparse dispatch.** Each expert runs only on the tokens routed to it, and a Switch-Transformer load-balancing loss prevents router collapse. **The experts specialize by domain:** in layer 0, 97.7% of prose tokens go to expert 0 and 82.8% of code tokens go to expert 1.
+- **Distributed training, two ways.** A ring all-reduce built on `torch.distributed` point-to-point primitives, and real `DistributedDataParallel`, both run side by side with `torchrun`. Along the way I found why `find_unused_parameters=True` is a *correctness* requirement for MoE under DDP, not a performance knob.
+- **Graph capture.** `torch.fx` and `torch.export` deliberately break on data-dependent MoE routing; the fix is shown live and verified numerically.
+- **Two tokenizers:** a byte-level BPE written from scratch, and the Hugging Face Rust `tokenizers` implementation for comparison.
+- **18 tests that each prove a property,** for example: RoPE attention depends only on relative position, the load-balancing loss matches its closed-form value, KV-cached decoding equals the dense forward pass, and the export-friendly MoE matches eager mode numerically.
+
+**Scope:** 9,033,856 parameters trained on a few kilobytes of original text. This is a systems-understanding project, not a competitive language model; see [Honest scope notes](#honest-scope-notes).
 
 ```
 tokens -> embed -> [ (RMSNorm -> Attention -> +residual) -> (RMSNorm -> MoE(2 experts) -> +residual) ] x N -> RMSNorm -> unembed -> logits
